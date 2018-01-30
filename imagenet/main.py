@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import time
+import socket
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,11 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
+
+import torch.multiprocessing as mp
+if __name__ == '__main__':
+    mp.set_start_method('forkserver')
+
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
@@ -55,6 +61,8 @@ parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
+parser.add_argument('--rank', default=-1, type=int,
+                    help='rank of distributed processes')
 
 best_prec1 = 0
 
@@ -66,9 +74,26 @@ def main():
     args.distributed = args.world_size > 1
 
     if args.distributed:
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size)
-
+        if args.dist_url.startswith("tcp://"):
+            if args.rank != -1:
+                rank = args.rank
+                local_rank = rank % 8
+            else:
+                local_rank = int(os.environ.get("SLURM_LOCALID"))
+                rank = int(os.environ.get("SLURM_NODEID")) * \
+                        int(os.environ.get("SLURM_NTASKS_PER_NODE")) + \
+                        local_rank
+            print("Rank: {}, host: {}".format(rank, socket.gethostname()))
+            device = local_rank
+            dist.init_process_group(backend=args.dist_backend,
+                                    init_method=args.dist_url,
+                                    world_size=args.world_size,
+                                    rank=rank)
+        else:
+            dist.init_process_group(backend=args.dist_backend,
+                                    init_method=args.dist_url,
+                                    world_size=args.world_size)
+    torch.cuda.set_device(device)
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -85,8 +110,10 @@ def main():
             model = torch.nn.DataParallel(model).cuda()
     else:
         model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model)
-
+        print("Using device: {}".format(device))
+        model = torch.nn.parallel.DistributedDataParallel(model,
+                                                          device_ids=[device],
+                                                          output_device=device)
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
